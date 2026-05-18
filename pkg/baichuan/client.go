@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -359,6 +360,13 @@ func (c *Client) StartPreview(ctx context.Context, channel uint8, stream Stream)
 				}
 
 				if msg.Header.StreamType != streamType {
+					continue
+				}
+
+				// Only skip pure keepalive messages (which do not carry media frames).
+				// Legitimate media packets (with headers and payload) always have a size > 8 bytes,
+				// whereas pure keepalive packets only carry a 4-byte check value.
+				if len(msg.XML) > 0 && strings.Contains(msg.XML, "checkPos") && len(msg.Payload) <= 8 {
 					continue
 				}
 
