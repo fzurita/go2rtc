@@ -192,6 +192,42 @@ func (c *Client) Start() error {
 		c.reader = reader
 	}
 
+	// Set up the wall-clock pacers. The camera delivers video in bursts while
+	// audio is steady and self-clocked; writing packets straight through makes
+	// audio race seconds ahead of video. The pacers re-impose the original
+	// timing on the wire, keeping A/V aligned (port of reolinkproxy's pacer).
+	if !c.started.Swap(true) {
+		pacerCtx, pacerCancel := context.WithCancel(context.Background())
+		c.pacerCancel = pacerCancel
+
+		c.videoPace.reset()
+		c.videoPacer = &mediaPacer{
+			ch:             make(chan pacedFrame, 400),
+			maxLead:        3000 * time.Millisecond,
+			initialLatency: 1500 * time.Millisecond,
+			snapOnPast:     false,
+			logf:           c.logWarn,
+		}
+		c.pacerWg.Add(1)
+		go func() {
+			defer c.pacerWg.Done()
+			c.videoPacer.run(pacerCtx)
+		}()
+
+		c.audioPacer = &mediaPacer{
+			ch:             make(chan pacedFrame, 200),
+			maxLead:        2000 * time.Millisecond,
+			initialLatency: 1500 * time.Millisecond,
+			snapOnPast:     true,
+			logf:           c.logWarn,
+		}
+		c.pacerWg.Add(1)
+		go func() {
+			defer c.pacerWg.Done()
+			c.audioPacer.run(pacerCtx)
+		}()
+	}
+
 	var videoCount, audioCount int
 
 	// replay the I-Frame that was consumed during Probe
@@ -223,7 +259,6 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 		if !packet.HasTimestamp {
 			return
 		}
-
 
 		if packet.Codec == "H265" {
 			// NALU reordering...
@@ -277,8 +312,6 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 		timestamp := c.videoRTP.next(rawVideoRTP)
 		c.lastVideoUS = relativeUS
 
-		c.lastWriteTime = time.Now()
-
 		pkt := &core.Packet{
 			Header: rtp.Header{
 				Marker:    true,
@@ -287,18 +320,28 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			Payload: packet.Data,
 		}
 
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecH264 || receiver.Codec.Name == core.CodecH265 {
-				if receiver.Codec.Name == core.CodecH264 && packet.Codec != "H264" {
-					continue
-				}
-				if receiver.Codec.Name == core.CodecH265 && packet.Codec != "H265" {
-					continue
-				}
+		videoCodec := packet.Codec
+		write := func(p *core.Packet) {
+			for _, receiver := range c.receivers {
+				if receiver.Codec.Name == core.CodecH264 || receiver.Codec.Name == core.CodecH265 {
+					if receiver.Codec.Name == core.CodecH264 && videoCodec != "H264" {
+						continue
+					}
+					if receiver.Codec.Name == core.CodecH265 && videoCodec != "H265" {
+						continue
+					}
 
-				clone := *pkt
-				receiver.WriteRTP(&clone)
+					clone := *p
+					receiver.WriteRTP(&clone)
+				}
 			}
+		}
+
+		dur := c.videoPace.durationForFrame(relativeUS)
+		if c.videoPacer != nil {
+			c.videoPacer.enqueue(pacedFrame{pkts: []*core.Packet{pkt}, write: write, duration: dur})
+		} else {
+			write(pkt)
 		}
 		*videoCount++
 
@@ -310,6 +353,37 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 		if !c.audioEnabled {
 			return
 		}
+
+		var aacClockRate uint32 = 16000
+		for _, receiver := range c.receivers {
+			if receiver.Codec.Name == core.CodecAAC {
+				aacClockRate = receiver.Codec.ClockRate
+				break
+			}
+		}
+
+		// Gate audio on video arrival so audio never races ahead of video.
+		// This mirrors what reolinkproxy does via handler.setReady(), which
+		// only creates the RTSP stream once video VPS/SPS/PPS are extracted,
+		// effectively starting audio and video at the same wall-clock instant.
+		if c.videoEnabled && !c.baseSet {
+			return
+		}
+
+		// Initialize audio sample counter from wall clock so audio timestamps
+		// start at a reasonable position relative to video (or wall clock).
+		if *audioCount == 0 {
+			if !c.baseSet {
+				// Video disabled or not yet arrived; start from zero.
+				c.baseTime = time.Now()
+				c.baseSet = true
+				c.audioSamples = 0
+			} else {
+				elapsed := time.Since(c.baseTime)
+				c.audioSamples = uint64(elapsed.Microseconds()) * uint64(aacClockRate) / 1_000_000
+			}
+		}
+
 		var pkts []*core.Packet
 		payload := packet.Data
 		for len(payload) > 0 {
@@ -329,11 +403,13 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 
 			pkt := &core.Packet{
 				Header: rtp.Header{
-					Version: aac.RTPPacketVersionAAC,
-					Marker:  true,
+					Version:   aac.RTPPacketVersionAAC,
+					Marker:    true,
+					Timestamp: c.audioRTP.next(uint32(c.audioSamples)),
 				},
 				Payload: rawAAC,
 			}
+			c.audioSamples += 1024
 			pkts = append(pkts, pkt)
 			payload = payload[frameLen:]
 		}
@@ -342,77 +418,29 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			return
 		}
 
-		var clockRate uint32 = 16000
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecAAC {
-				clockRate = receiver.Codec.ClockRate
-				break
-			}
-		}
-
-		if *audioCount == 0 {
-			if !c.baseSet {
-				c.baseTime = time.Now()
-				c.baseSet = true
-				c.audioSamples = 0
-			} else if c.baseTicks != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-				c.audioSamples = c.guardedVideoUS() * uint64(clockRate) / 1_000_000
-			} else {
-				elapsed := time.Since(c.baseTime)
-				c.audioSamples = uint64(elapsed.Microseconds()) * uint64(clockRate) / 1_000_000
-			}
-		}
-
-
-
-		var outPkts []*core.Packet
-		for _, pkt := range pkts {
-			if c.baseSet {
-				var targetUS uint64
-				if c.baseTicks != 0 && c.lastVideoUS != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-					targetUS = c.guardedVideoUS()
-				} else {
-					targetUS = uint64(time.Since(c.baseTime).Microseconds())
-				}
-
-				expectedAudioUS := c.audioSamples * 1_000_000 / uint64(clockRate)
-				driftUS := int64(expectedAudioUS) - int64(targetUS)
-				driftSamples := driftUS * int64(clockRate) / 1_000_000
-
-				if driftSamples >= 1024 {
-					continue // Drop packet
-				} else if driftSamples <= -1024 {
-					clone1 := *pkt
-					clone1.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += 1024
-					outPkts = append(outPkts, &clone1)
-
-					clone2 := *pkt
-					clone2.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += 1024
-					outPkts = append(outPkts, &clone2)
-					continue
-				}
-			}
-
-			pkt.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-			c.audioSamples += 1024
-			outPkts = append(outPkts, pkt)
-		}
-
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecAAC {
-				for _, pkt := range outPkts {
-					clone := *pkt
+		aacWrite := func(p *core.Packet) {
+			for _, receiver := range c.receivers {
+				if receiver.Codec.Name == core.CodecAAC {
+					clone := *p
 					receiver.WriteRTP(&clone)
 				}
 			}
 		}
 
-		*audioCount += len(outPkts)
-		if *audioCount <= 3 && len(outPkts) > 0 {
+		aacSamples := uint64(len(pkts)) * 1024
+		aacDur := time.Duration(aacSamples*1_000_000/uint64(aacClockRate)) * time.Microsecond
+		if c.audioPacer != nil {
+			c.audioPacer.enqueue(pacedFrame{pkts: pkts, write: aacWrite, duration: aacDur})
+		} else {
+			for _, pkt := range pkts {
+				aacWrite(pkt)
+			}
+		}
+
+		*audioCount += len(pkts)
+		if *audioCount <= 3 && len(pkts) > 0 {
 			c.logDebug("audio pkt #%d len=%d ts=%d",
-				*audioCount, len(outPkts[0].Payload), outPkts[0].Timestamp)
+				*audioCount, len(pkts[0].Payload), pkts[0].Timestamp)
 		}
 	case baichuan.MediaPacketADPCM:
 		if !c.audioEnabled {
@@ -437,13 +465,22 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			}
 		}
 
+		// Gate audio on video arrival so audio never races ahead of video.
+		// This mirrors what reolinkproxy does via handler.setReady(), which
+		// only creates the RTSP stream once video VPS/SPS/PPS are extracted,
+		// effectively starting audio and video at the same wall-clock instant.
+		if c.videoEnabled && !c.baseSet {
+			return
+		}
+
+		// Initialize audio sample counter from wall clock so audio timestamps
+		// start at a reasonable position relative to video (or wall clock).
 		if *audioCount == 0 {
 			if !c.baseSet {
+				// Video disabled or not yet arrived; start from zero.
 				c.baseTime = time.Now()
 				c.baseSet = true
 				c.audioSamples = 0
-			} else if c.baseTicks != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-				c.audioSamples = c.guardedVideoUS() * uint64(clockRate) / 1_000_000
 			} else {
 				elapsed := time.Since(c.baseTime)
 				c.audioSamples = uint64(elapsed.Microseconds()) * uint64(clockRate) / 1_000_000
@@ -451,6 +488,7 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 		}
 
 		var pkts []*core.Packet
+		var pcmaSamples uint64
 		payload := pcma
 		for len(payload) > 0 {
 			chunkSize := 160
@@ -462,75 +500,44 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 
 			pkt := &core.Packet{
 				Header: rtp.Header{
-					Marker: true,
+					Marker:    true,
+					Timestamp: c.audioRTP.next(uint32(c.audioSamples)),
 				},
 				Payload: chunk,
 			}
+			c.audioSamples += uint64(chunkSize)
+			pcmaSamples += uint64(chunkSize)
 			pkts = append(pkts, pkt)
 		}
 
-
-
-		var outPkts []*core.Packet
-		for _, pkt := range pkts {
-			chunkSize := int64(len(pkt.Payload))
-			if c.baseSet {
-				var targetUS uint64
-				if c.baseTicks != 0 && c.lastVideoUS != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-					targetUS = c.guardedVideoUS()
-				} else {
-					targetUS = uint64(time.Since(c.baseTime).Microseconds())
-				}
-
-				expectedAudioUS := c.audioSamples * 1_000_000 / uint64(clockRate)
-				driftUS := int64(expectedAudioUS) - int64(targetUS)
-				driftSamples := driftUS * int64(clockRate) / 1_000_000
-
-				if driftSamples >= chunkSize {
-					continue // Drop packet
-				} else if driftSamples <= -chunkSize {
-					clone1 := *pkt
-					clone1.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += uint64(chunkSize)
-					outPkts = append(outPkts, &clone1)
-
-					clone2 := *pkt
-					clone2.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += uint64(chunkSize)
-					outPkts = append(outPkts, &clone2)
-					continue
-				}
-			}
-
-			pkt.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-			c.audioSamples += uint64(chunkSize)
-			outPkts = append(outPkts, pkt)
+		if len(pkts) == 0 {
+			return
 		}
 
-		for _, receiver := range c.receivers {
-			if receiver.Codec.Name == core.CodecPCMA {
-				for _, pkt := range outPkts {
-					clone := *pkt
+		pcmaWrite := func(p *core.Packet) {
+			for _, receiver := range c.receivers {
+				if receiver.Codec.Name == core.CodecPCMA {
+					clone := *p
 					receiver.WriteRTP(&clone)
 				}
 			}
 		}
 
-		*audioCount += len(outPkts)
-		if *audioCount <= 3 && len(outPkts) > 0 {
+		pcmaDur := time.Duration(pcmaSamples*1_000_000/uint64(clockRate)) * time.Microsecond
+		if c.audioPacer != nil {
+			c.audioPacer.enqueue(pacedFrame{pkts: pkts, write: pcmaWrite, duration: pcmaDur})
+		} else {
+			for _, pkt := range pkts {
+				pcmaWrite(pkt)
+			}
+		}
+
+		*audioCount += len(pkts)
+		if *audioCount <= 3 && len(pkts) > 0 {
 			c.logDebug("audio pkt #%d len=%d ts=%d",
-				*audioCount, len(outPkts[0].Payload), outPkts[0].Timestamp)
+				*audioCount, len(pkts[0].Payload), pkts[0].Timestamp)
 		}
 	}
-}
-
-func (c *Client) guardedVideoUS() uint64 {
-	offsetUS := int64(int32(c.videoRTP.offset)) * 1_000_000 / 90000
-	guarded := int64(c.lastVideoUS) + offsetUS
-	if guarded < 0 {
-		return 0
-	}
-	return uint64(guarded)
 }
 
 func (c *Client) Stop() error {
@@ -577,8 +584,6 @@ func (u *timestampUnwrapper) unwrap(ts32 uint32) uint64 {
 	}
 	return continuous
 }
-
-
 
 func unwrapTimestamp(ts32 uint32, highest64 uint64) uint64 {
 	if highest64 == 0 {
