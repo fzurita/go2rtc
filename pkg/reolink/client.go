@@ -51,15 +51,17 @@ type Client struct {
 	audioRTP     rtpTimestampGuard
 	adpcmDecoder *baichuan.ADPCMDecoder
 
-	baseTicks      uint64
-	baseTime       time.Time
-	baseSet        bool
-	lastVideoUS    uint64
+	baseTicks   uint64
+	baseTime    time.Time
+	baseSet     bool
+	lastVideoUS uint64
 
 	talkMu    sync.Mutex
 	talkTimer *time.Timer
 
 	lastWriteTime time.Time
+
+	audioCorrectionDir int8 // 0=not actively correcting, 1=drop, -1=dup
 }
 
 func Dial(rawURL string) (*Client, error) {

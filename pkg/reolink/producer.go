@@ -15,6 +15,11 @@ import (
 	"github.com/pion/rtp"
 )
 
+// audioSyncThresholdUS is the minimum drift (in microseconds) before audio
+// dup/drop correction kicks in. 200ms is large enough to absorb video timestamp
+// jitter without triggering spurious corrections every second.
+const audioSyncThresholdUS = 200_000
+
 func (c *Client) GetMedias() []*core.Media {
 	return c.medias
 }
@@ -224,7 +229,6 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			return
 		}
 
-
 		if packet.Codec == "H265" {
 			// NALU reordering...
 			nalus := splitAnnexB(packet.Data)
@@ -363,36 +367,10 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			}
 		}
 
-
-
 		var outPkts []*core.Packet
 		for _, pkt := range pkts {
-			if c.baseSet {
-				var targetUS uint64
-				if c.baseTicks != 0 && c.lastVideoUS != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-					targetUS = c.guardedVideoUS()
-				} else {
-					targetUS = uint64(time.Since(c.baseTime).Microseconds())
-				}
-
-				expectedAudioUS := c.audioSamples * 1_000_000 / uint64(clockRate)
-				driftUS := int64(expectedAudioUS) - int64(targetUS)
-				driftSamples := driftUS * int64(clockRate) / 1_000_000
-
-				if driftSamples >= 1024 {
-					continue // Drop packet
-				} else if driftSamples <= -1024 {
-					clone1 := *pkt
-					clone1.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += 1024
-					outPkts = append(outPkts, &clone1)
-
-					clone2 := *pkt
-					clone2.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += 1024
-					outPkts = append(outPkts, &clone2)
-					continue
-				}
+			if c.baseSet && c.correctAudioDriftShouldDrop(pkt, clockRate, 1024, &outPkts) {
+				continue
 			}
 
 			pkt.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
@@ -469,41 +447,15 @@ func (c *Client) processPacket(packet baichuan.MediaPacket, videoCount, audioCou
 			pkts = append(pkts, pkt)
 		}
 
-
-
 		var outPkts []*core.Packet
 		for _, pkt := range pkts {
-			chunkSize := int64(len(pkt.Payload))
-			if c.baseSet {
-				var targetUS uint64
-				if c.baseTicks != 0 && c.lastVideoUS != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
-					targetUS = c.guardedVideoUS()
-				} else {
-					targetUS = uint64(time.Since(c.baseTime).Microseconds())
-				}
-
-				expectedAudioUS := c.audioSamples * 1_000_000 / uint64(clockRate)
-				driftUS := int64(expectedAudioUS) - int64(targetUS)
-				driftSamples := driftUS * int64(clockRate) / 1_000_000
-
-				if driftSamples >= chunkSize {
-					continue // Drop packet
-				} else if driftSamples <= -chunkSize {
-					clone1 := *pkt
-					clone1.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += uint64(chunkSize)
-					outPkts = append(outPkts, &clone1)
-
-					clone2 := *pkt
-					clone2.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-					c.audioSamples += uint64(chunkSize)
-					outPkts = append(outPkts, &clone2)
-					continue
-				}
+			chunkSize := uint64(len(pkt.Payload))
+			if c.baseSet && c.correctAudioDriftShouldDrop(pkt, clockRate, chunkSize, &outPkts) {
+				continue
 			}
 
 			pkt.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
-			c.audioSamples += uint64(chunkSize)
+			c.audioSamples += chunkSize
 			outPkts = append(outPkts, pkt)
 		}
 
@@ -531,6 +483,58 @@ func (c *Client) guardedVideoUS() uint64 {
 		return 0
 	}
 	return uint64(guarded)
+}
+
+// correctAudioDriftShouldDrop checks for audio/video timestamp drift and applies packet
+// drop or duplication. Once drift exceeds audioSyncThresholdUS, active
+// correction starts and continues dropping/duping packets until drift reaches zero.
+// Returns true if the packet should be dropped, false if caller should proceed normally.
+func (c *Client) correctAudioDriftShouldDrop(pkt *core.Packet, clockRate uint32, chunkSize uint64, outPkts *[]*core.Packet) bool {
+	var targetUS uint64
+	if c.baseTicks != 0 && c.lastVideoUS != 0 && time.Since(c.lastWriteTime) < 500*time.Millisecond {
+		targetUS = c.guardedVideoUS()
+	} else {
+		targetUS = uint64(time.Since(c.baseTime).Microseconds())
+	}
+
+	expectedAudioUS := c.audioSamples * 1_000_000 / uint64(clockRate)
+	driftUS := int64(expectedAudioUS) - int64(targetUS)
+	driftSamples := driftUS * int64(clockRate) / 1_000_000
+
+	entryThresholdSamples := int64(audioSyncThresholdUS) * int64(clockRate) / 1_000_000
+
+	// If not currently correcting, check if we need to start.
+	if c.audioCorrectionDir == 0 {
+		if driftSamples >= entryThresholdSamples {
+			c.audioCorrectionDir = 1
+		} else if driftSamples <= -entryThresholdSamples {
+			c.audioCorrectionDir = -1
+		} else {
+			return false
+		}
+	}
+
+	// Exit correction if drift has reversed past zero.
+	if (c.audioCorrectionDir == 1 && driftSamples <= 0) ||
+		(c.audioCorrectionDir == -1 && driftSamples >= 0) {
+		c.audioCorrectionDir = 0
+		return false
+	}
+
+	// Still correcting. Determine action from current drift sign.
+	if driftSamples > 0 {
+		// Audio ahead: drop packet and advance samples to skip it.
+		c.logDebug("audio pkt drop")
+		return true
+	}
+
+	// Audio behind: duplicate packet.
+	clone := *pkt
+	clone.Timestamp = c.audioRTP.next(uint32(c.audioSamples))
+	c.audioSamples += chunkSize
+	*outPkts = append(*outPkts, &clone)
+	c.logDebug("audio pkt dup")
+	return false
 }
 
 func (c *Client) Stop() error {
@@ -577,8 +581,6 @@ func (u *timestampUnwrapper) unwrap(ts32 uint32) uint64 {
 	}
 	return continuous
 }
-
-
 
 func unwrapTimestamp(ts32 uint32, highest64 uint64) uint64 {
 	if highest64 == 0 {
